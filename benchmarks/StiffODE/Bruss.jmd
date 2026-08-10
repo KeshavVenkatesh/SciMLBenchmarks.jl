@@ -531,6 +531,249 @@ The stabilized methods outperformed the implicit methods again.
 Although ROCK4 is marginally faster at moderate tolerances, 
 TSRKC3 is more robust and more reliably meets the prescribed tolerances, making it the better choice.
 
+## Exponential vs Implicit Methods as the Spatial Grid Grows
+
+The preceding work-precision diagrams use an $8 \times 8$ grid. This section keeps the
+same Brusselator equations, periodic finite-difference discretization, forcing event at
+$t=1.1$, and integration interval $t \in [0,11.5]$, while increasing the grid size.
+Fixed-step exponential methods are swept over `dt`; adaptive implicit and IMEX methods
+are swept over tolerances. All curves report final-state error against the same
+tight reference solution, and the implicit baselines use sparse KLU factorizations. The
+IMEX method uses a sparse function-form split, while the exponential methods retain a
+matrix-operator split. Every fixed step size places the forcing onset on its time grid;
+the adaptive methods receive `tstops = [1.1]` explicitly.
+
+```julia
+using OrdinaryDiffEq, DiffEqDevTools, Sundials, SparseArrays, LinearSolve,
+      LinearAlgebra, Plots, OrdinaryDiffEqExponentialRK, ExponentialUtilities
+using SciMLOperators: MatrixOperator
+using OrdinaryDiffEqSDIRK: KenCarp4
+gr()
+
+brusselator_scaling_forcing(x, y, t) =
+    (((x - 0.3)^2 + (y - 0.6)^2) <= 0.1^2) *
+    (t >= 1.1 - 100 * eps(1.1)) * 5.0
+
+function init_brusselator_scaling(grid_n)
+    xyd = range(0.0, 1.0; length = grid_n)
+    u0 = zeros(grid_n, grid_n, 2)
+    @inbounds for j in 1:grid_n, i in 1:grid_n
+        x, y = xyd[i], xyd[j]
+        u0[i, j, 1] = 22 * (y * (1 - y))^(3 / 2)
+        u0[i, j, 2] = 27 * (x * (1 - x))^(3 / 2)
+    end
+    return u0, xyd
+end
+
+function brusselator_scaling_diffusion(grid_n, alpha, dx)
+    d1 = spdiagm(
+        -1 => ones(grid_n - 1),
+        0 => fill(-2.0, grid_n),
+        1 => ones(grid_n - 1),
+    )
+    d1[1, end] = 1.0
+    d1[end, 1] = 1.0
+    identity_n = spdiagm(0 => ones(grid_n))
+    laplacian_2d = kron(identity_n, d1) + kron(d1, identity_n)
+    species_identity = spdiagm(0 => ones(2))
+    return (alpha / dx^2) * kron(species_identity, laplacian_2d)
+end
+
+function brusselator_scaling_reaction!(du, u, p, t)
+    grid_n = p.grid_n
+    u3 = reshape(u, grid_n, grid_n, 2)
+    du3 = reshape(du, grid_n, grid_n, 2)
+    @inbounds for j in 1:grid_n, i in 1:grid_n
+        u1, u2 = u3[i, j, 1], u3[i, j, 2]
+        u1sq_u2 = u1 * u1 * u2
+        du3[i, j, 1] = p.B + u1sq_u2 - (p.A + 1) * u1 +
+                       brusselator_scaling_forcing(p.xyd[i], p.xyd[j], t)
+        du3[i, j, 2] = p.A * u1 - u1sq_u2
+    end
+    return nothing
+end
+
+function brusselator_scaling_diffusion!(du, u, p, t)
+    mul!(du, p.L, u)
+    return nothing
+end
+
+function brusselator_scaling_diffusion_jac!(J, u, p, t)
+    copyto!(J.nzval, p.L.nzval)
+    return nothing
+end
+
+function brusselator_scaling_full!(du, u, p, t)
+    mul!(du, p.L, u)
+    grid_n = p.grid_n
+    u3 = reshape(u, grid_n, grid_n, 2)
+    du3 = reshape(du, grid_n, grid_n, 2)
+    @inbounds for j in 1:grid_n, i in 1:grid_n
+        u1, u2 = u3[i, j, 1], u3[i, j, 2]
+        u1sq_u2 = u1 * u1 * u2
+        du3[i, j, 1] += p.B + u1sq_u2 - (p.A + 1) * u1 +
+                        brusselator_scaling_forcing(p.xyd[i], p.xyd[j], t)
+        du3[i, j, 2] += p.A * u1 - u1sq_u2
+    end
+    return nothing
+end
+
+function brusselator_scaling_jac!(J, u, p, t)
+    copyto!(J.nzval, p.jac_template.nzval)
+    cells = p.grid_n^2
+    @inbounds for cell in 1:cells
+        u1 = u[cell]
+        u2 = u[cells + cell]
+        two_u1_u2 = 2.0 * u1 * u2
+        u1_squared = u1 * u1
+        J[cell, cell] += two_u1_u2 - (p.A + 1)
+        J[cell, cells + cell] = u1_squared
+        J[cells + cell, cell] = p.A - two_u1_u2
+        J[cells + cell, cells + cell] -= u1_squared
+    end
+    return nothing
+end
+
+function brusselator_scaling_problems(grid_n)
+    u0_array, xyd = init_brusselator_scaling(grid_n)
+    dx = Float64(step(xyd))
+    L = brusselator_scaling_diffusion(grid_n, 10.0, dx)
+    u0 = vec(u0_array)
+
+    jac_prototype = copy(L)
+    cells = grid_n^2
+    @inbounds for cell in 1:cells
+        jac_prototype[cell, cells + cell] = 1.0
+        jac_prototype[cells + cell, cell] = 1.0
+    end
+
+    p = (;
+        grid_n,
+        xyd,
+        A = 3.4,
+        B = 1.0,
+        L,
+        jac_template = copy(jac_prototype),
+    )
+
+    tspan = (0.0, 11.5)
+    full_f = ODEFunction(
+        brusselator_scaling_full!;
+        jac = brusselator_scaling_jac!,
+        jac_prototype = copy(jac_prototype),
+    )
+    full_prob = ODEProblem(full_f, copy(u0), tspan, p)
+
+    imex_implicit_f = ODEFunction(
+        brusselator_scaling_diffusion!;
+        jac = brusselator_scaling_diffusion_jac!,
+        jac_prototype = copy(L),
+    )
+    imex_prob = SplitODEProblem(
+        imex_implicit_f,
+        brusselator_scaling_reaction!,
+        copy(u0),
+        tspan,
+        p,
+    )
+
+    etd_prob = SplitODEProblem(
+        MatrixOperator(L),
+        brusselator_scaling_reaction!,
+        copy(u0),
+        tspan,
+        p,
+    )
+    return full_prob, imex_prob, etd_prob
+end
+
+function brusselator_scaling_workprecision(grid_n)
+    full_prob, imex_prob, etd_prob = brusselator_scaling_problems(grid_n)
+    reference = solve(full_prob, CVODE_BDF(linear_solver = :KLU);
+        abstol = 1e-11, reltol = 1e-11, tstops = [1.1],
+        save_everystep = false, dense = false, maxiters = Int(1e7))
+
+    bruss_reltols = 10.0 .^ (-2:-1:-7)
+    bruss_abstols = 1e-3 .* bruss_reltols
+    bruss_dts = 0.1 .* 0.5 .^ (0:5)
+
+    bruss_setups = [
+        Dict(:alg => FBDF(linsolve = KLUFactorization()), :prob_choice => 1,
+            :tstops => [1.1]),
+        Dict(:alg => Rodas5P(linsolve = KLUFactorization()), :prob_choice => 1,
+            :tstops => [1.1]),
+        Dict(:alg => KenCarp4(linsolve = KLUFactorization(), concrete_jac = true),
+            :prob_choice => 2, :tstops => [1.1], :dtmax => 0.1),
+        Dict(:alg => ETDRK2(krylov = true, m = 30), :prob_choice => 3,
+            :dts => bruss_dts, :adaptive => false),
+        Dict(:alg => ETDRK4(krylov = true, m = 30), :prob_choice => 3,
+            :dts => bruss_dts, :adaptive => false),
+        Dict(:alg => ETDRK4(krylov = true, m = 30, iop = 2), :prob_choice => 3,
+            :dts => bruss_dts, :adaptive => false),
+        Dict(:alg => HochOst4(krylov = true, m = 30), :prob_choice => 3,
+            :dts => bruss_dts, :adaptive => false),
+    ]
+    bruss_names = [
+        "FBDF (KLU)",
+        "Rodas5P (KLU)",
+        "KenCarp4 split (KLU)",
+        "ETDRK2 (Krylov m=30)",
+        "ETDRK4 (Krylov m=30)",
+        "ETDRK4 (Krylov m=30, iop=2)",
+        "HochOst4 (Krylov m=30)",
+    ]
+
+    println("N=$grid_n ($(2 * grid_n^2) ODEs)")
+    return WorkPrecisionSet(
+        [full_prob, imex_prob, etd_prob],
+        bruss_abstols,
+        bruss_reltols,
+        bruss_setups;
+        names = bruss_names,
+        print_names = true,
+        appxsol = [reference, reference, reference],
+        error_estimate = :final,
+        numruns = grid_n == 64 ? 3 : 5,
+        save_everystep = false,
+        dense = false,
+        maxiters = Int(1e7),
+    )
+end
+
+println("ExponentialUtilities version: ", pkgversion(ExponentialUtilities))
+println("OrdinaryDiffEqExponentialRK version: ", pkgversion(OrdinaryDiffEqExponentialRK))
+
+brusselator_scaling_grids = (16, 32, 64)
+brusselator_scaling_wps = [
+    brusselator_scaling_workprecision(grid_n)
+    for grid_n in brusselator_scaling_grids
+]
+brusselator_scaling_markers = [
+    :circle :diamond :utriangle :rect :cross :xcross :dtriangle
+]
+brusselator_scaling_linestyles = [
+    :solid :solid :solid :solid :solid :dash :solid
+]
+brusselator_scaling_plots = [
+    plot(brusselator_scaling_wps[i];
+        markershape = brusselator_scaling_markers,
+        linestyle = brusselator_scaling_linestyles,
+        xlabel = "Final-state error",
+        ylabel = i == firstindex(brusselator_scaling_grids) ? "Time (s)" : "",
+        legend = i == lastindex(brusselator_scaling_grids) ? :outertopright : false,
+        legendfontsize = 8,
+        titlefontsize = 11,
+        title = "N=$(brusselator_scaling_grids[i]) ($(2 * brusselator_scaling_grids[i]^2) ODEs)")
+    for i in eachindex(brusselator_scaling_grids)
+]
+brusselator_scaling_plot = plot(
+    brusselator_scaling_plots...;
+    layout = (1, length(brusselator_scaling_grids)),
+    size = (575 * length(brusselator_scaling_grids), 500),
+)
+brusselator_scaling_plot
+```
+
 ```julia, echo = false
 using SciMLBenchmarks
 SciMLBenchmarks.bench_footer(WEAVE_ARGS[:folder], WEAVE_ARGS[:file])
